@@ -5,7 +5,7 @@
   "ignore_mismatched_sizes": true,
   
   "local_dataset": true,
-  "dataset_name": "./data/your_dataset",
+  "dataset_name": "your_dataset",
   "nifti_column_name": "nifti",
   "label_column_name": "label",
   
