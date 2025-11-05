@@ -7,7 +7,7 @@ from monai.transforms import (
     Resize,
     NormalizeIntensity,
     ScaleIntensity,
-    ClipIntensity,
+    ThresholdIntensity,
     # Intensity Transforms
     RandGaussianNoise,
     RandGaussianSmooth,
@@ -204,7 +204,10 @@ class ClassificationPresetTrain:
         # Clip intensity if specified
         if clip_min_max is not None:
             transforms.append(
-                ClipIntensity(min=clip_min_max[0], max=clip_min_max[1])
+                ThresholdIntensity(threshold=clip_min_max[0], above=False, cval=clip_min_max[0])
+            )
+            transforms.append(
+                ThresholdIntensity(threshold=clip_min_max[1], above=True, cval=clip_min_max[1])
             )
         
         # Final normalization: use either NormalizeIntensity or ScaleIntensity
@@ -242,14 +245,17 @@ class ClassificationPresetEval:
         # Clip intensity if specified
         if clip_min_max is not None:
             transforms.append(
-                ClipIntensity(min=clip_min_max[0], max=clip_min_max[1])
+                ThresholdIntensity(threshold=clip_min_max[0], above=False, cval=clip_min_max[0])
+            )
+            transforms.append(
+                ThresholdIntensity(threshold=clip_min_max[1], above=True, cval=clip_min_max[1])
             )
         
         # Final normalization: use either NormalizeIntensity or ScaleIntensity
         if use_normalize_intensity:
             transforms.append(NormalizeIntensity(nonzero=normalize_nonzero))
-        else:
-            transforms.append(ScaleIntensity(minv=scale_minv, maxv=scale_maxv))
+        # else:
+        #     transforms.append(ScaleIntensity(minv=scale_minv, maxv=scale_maxv))
 
         self.transforms = Compose(transforms)
 
@@ -262,7 +268,7 @@ class ClassificationPresetEval:
     
 def preprocess_train(batch, train_transforms):
     batch["pixel_values"] = [
-        train_transforms(nib.load(nifti).get_fdata()) for nifti in batch["nifti"]
+        train_transforms(nifti.get_fdata()) for nifti in batch["nifti"]
     ]
     return batch
 
@@ -271,7 +277,7 @@ def preprocess_valid(batch, valid_transforms):
     """Apply train_transforms across a batch."""
     if "nifti" in batch:
         batch["pixel_values"] = [
-            valid_transforms(nib.load(nifti).get_fdata()) for nifti in batch["nifti"]
+            valid_transforms(nifti.get_fdata()) for nifti in batch["nifti"]
     ]
     return batch
 
@@ -284,6 +290,7 @@ def load_dataset(dataset, args):
     # Normalization parameters
     clip_min_max = getattr(args, "clip_min_max", None)
     use_normalize_intensity = getattr(args, "use_normalize_intensity", True)
+    normalize_nonzero = getattr(args, "normalize_nonzero", False)
     scale_minv = getattr(args, "scale_minv", 0.0)
     scale_maxv = getattr(args, "scale_maxv", 1.0)
     
@@ -365,6 +372,7 @@ def load_dataset(dataset, args):
         crop_size=crop_size,
         clip_min_max=clip_min_max,
         use_normalize_intensity=use_normalize_intensity,
+        normalize_nonzero=normalize_nonzero,
         scale_minv=scale_minv,
         scale_maxv=scale_maxv,
     )
@@ -391,6 +399,7 @@ def load_test_dataset(dataset, args):
         crop_size=crop_size,
         clip_min_max=clip_min_max,
         use_normalize_intensity=use_normalize_intensity,
+        normalize_nonzero=normalize_nonzero,
         scale_minv=scale_minv,
         scale_maxv=scale_maxv,
     )

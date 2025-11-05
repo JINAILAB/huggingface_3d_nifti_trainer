@@ -17,9 +17,8 @@
 import logging
 import sys
 import os
+import json
 from dataclasses import dataclass, field
-from functools import partial
-from typing import Any, Dict, List, Optional
 
 from datasets import load_from_disk, load_dataset
 import transformers
@@ -29,28 +28,19 @@ from transformers import (
                           TrainingArguments, 
                           Trainer, 
                           EarlyStoppingCallback, 
-                          set_seed
+                          set_seed,
+                          HfArgumentParser
                           )
 import data_presets
 import torch
 import datetime
 from image_utils import save_confusion_matrix, compute_metrics, create_hook, get_embedding_layer, save_umap, check_embedding
 
-import argparse
 import numpy as np
 import wandb
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-from gradcam_utils import category_name_to_index, save_gradcam
-from scipy.special import softmax
-import timm
-from torch import nn
-import json
-from accelerate import Accelerator
-import tempfile
+
 from dataclasses import dataclass, field
-from functools import partial
-from typing import Any, Dict, List, Mapping, Optional
-from transformers import HfArgumentParser
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +80,10 @@ class CustomTrainingArguments:
     use_normalize_intensity: bool = field(
         default=True,
         metadata={"help": "If True, use NormalizeIntensity (subtract mean, divide by std). If False, use ScaleIntensity (linear scaling to [scale_minv, scale_maxv])."}
+    )
+    normalize_nonzero: bool = field(
+        default=True,
+        metadata={"help": "For NormalizeIntensity: if True, only normalize non-zero values. Useful for images with background zeros."}
     )
     scale_minv: float = field(
         default=0.0,
@@ -217,6 +211,12 @@ class CustomTrainingArguments:
         default=(4, 4, 4),
         metadata={"help": "Spatial size for coarse dropout holes."}
     )
+    
+    # GPU and DataLoader parameters
+    gpu_ids: Optional[str] = field(
+        default=None,
+        metadata={"help": "GPU IDs to use (e.g., '0,1' or '0'). If not specified, uses default GPU selection."}
+    )
 
 @dataclass
 class DataTrainingArguments:
@@ -234,7 +234,7 @@ class DataTrainingArguments:
     )
     dataset_config_name: Optional[str] = field(
         default=None, metadata={"help": "The configuration name of the dataset to use (via the datasets library)."}
-    ),
+    )
     nifti_column_name: str = field(
         default="nifti",
         metadata={"help": "The name of the dataset column containing the image data. Defaults to 'image'."},
@@ -300,7 +300,30 @@ class ModelArguments:
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
     )
     
+def setup_logging(logger,training_args):
+    # Setup logging - force=True to override any existing configuration
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[logging.StreamHandler(sys.stdout)],
+        level=logging.INFO,
+        force=True
+    )
+
+    # Set transformers logging verbosity
+    transformers.utils.logging.set_verbosity_info()
     
+    log_level = training_args.get_process_log_level()
+    logger.setLevel(log_level)
+    transformers.utils.logging.set_verbosity(log_level)
+    transformers.utils.logging.enable_default_handler()
+    transformers.utils.logging.enable_explicit_format()
+    
+    logger.info(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
+        + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
+    )
+    logger.info(f"Training/evaluation parameters {training_args}")
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -315,49 +338,39 @@ def main():
     else:
         model_args, data_args, training_args, custom_args = parser.parse_args_into_dataclasses()
         
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-
-    if training_args.should_log:
-        # The default of training_args.log_level is passive, so we set log level at info here to have that default.
-        transformers.utils.logging.set_verbosity_info()
+    setup_logging(logger, training_args)
     
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
-    logger.warning(
-        f"Process rank: {training_args.local_process_index}, device: {training_args.device}, n_gpu: {training_args.n_gpu}, "
-        + f"distributed training: {training_args.parallel_mode.value == 'distributed'}, 16-bits training: {training_args.fp16}"
-    )
-    logger.info(f"Training/evaluation parameters {training_args}")
+    # Set GPU devices if specified
+    if custom_args.gpu_ids is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = custom_args.gpu_ids
+        logger.info(f"Using GPU(s): {custom_args.gpu_ids}")
 
     # Set seed before initializing model.
     set_seed(training_args.seed)
     
-
+    # set output directory
     now = datetime.datetime.now()
     now = now.strftime("%Y%m%d_%H%M")
 
-    
     model_name = model_args.model_name_or_path.split("/")[-1]
     output_dir = os.path.join('runs', custom_args.project_name, model_name + '_' + now)
+    
+    # initialize wandb
     if training_args.report_to == 'wandb':
         wandb.init(project=custom_args.project_name, name=model_name + '_' + now, dir=output_dir)
-    wandb.config.update({'dataset_name' : data_args.dataset_name})
-    parser.to_json_file(os.path.join(output_dir, "config.json"), args_dict={**vars(model_args), **vars(data_args), **vars(training_args)})
+        wandb.config.update({'dataset_name' : data_args.dataset_name})
+    
+    # Save config to JSON
+    os.makedirs(output_dir, exist_ok=True)
+    config_dict = {**vars(model_args), **vars(data_args), **vars(training_args)}
+    with open(os.path.join(output_dir, "config.json"), 'w', encoding='utf-8') as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False, default=str)
 
     dataset = load_from_disk(data_args.dataset_name) if data_args.local_dataset else load_dataset(
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
             token=model_args.token,
-            trust_remote_code=model_args.trust_remote_code,
         )
     
     dataset_column_names = dataset["train"].column_names if "train" in dataset else dataset["validation"].column_names
@@ -383,13 +396,26 @@ def main():
     
     train_ds, valid_ds, train_transform, valid_transform = data_presets.load_dataset(dataset, custom_args)
     
-    model = AutoModelForImageClassification.from_pretrained(
-        model_args.model_name_or_path,
-        label2id=label2id,
-        id2label=id2label,
-        ignore_mismatched_sizes = True, 
-        # cache_dir=tempfile.mkdtemp() # provide this in case you're planning to fine-tune an already fine-tuned checkpoint
-    )
+    # Load model based on use_pretrained flag
+    if model_args.use_pretrained:
+        logger.info("Loading pretrained model from %s", model_args.model_name_or_path)
+        model = AutoModelForImageClassification.from_pretrained(
+            model_args.model_name_or_path,
+            label2id=label2id,
+            id2label=id2label,
+            ignore_mismatched_sizes=True, 
+            trust_remote_code=model_args.trust_remote_code,
+            # cache_dir=tempfile.mkdtemp() # provide this in case you're planning to fine-tune an already fine-tuned checkpoint
+        )
+    else:
+        logger.info("Creating model from config (randomly initialized) based on %s", model_args.model_name_or_path)
+        config = AutoConfig.from_pretrained(
+            model_args.model_name_or_path,
+            label2id=label2id,
+            id2label=id2label,
+            trust_remote_code=model_args.trust_remote_code,
+        )
+        model = AutoModelForImageClassification.from_config(config, trust_remote_code=model_args.trust_remote_code)
 
     training_args.logging_dir = output_dir
     training_args.output_dir = output_dir 
@@ -407,7 +433,7 @@ def main():
         training_args,
         train_dataset=train_ds,
         eval_dataset=valid_ds,
-        tokenizer=train_transform,
+        # tokenizer=train_transform,
         compute_metrics=compute_metrics,
         data_collator=collate_fn,
         callbacks=trainer_callbacks
@@ -430,16 +456,16 @@ def main():
     y_valid = np.array(valid_ds['label'])
     save_confusion_matrix(y_preds, y_valid, labels, output_dir)
     
-    
     if custom_args.umap:
         all_embeddings = check_embedding(model, embedding_outputs)
         save_umap(all_embeddings, y_valid, labels, output_dir)
         hook_handle.remove()
     
-    if custom_args.gradcam:
-        save_gradcam(model, id2label, output_dir, valid_ds, valid_transform, custom_args.crop_size)
+    # if custom_args.gradcam:
+    #     save_gradcam(model, id2label, output_dir, valid_ds, valid_transform, custom_args.crop_size)
     
-    wandb.finish(exit_code=0) 
+    if training_args.report_to == 'wandb':
+        wandb.finish(exit_code=0) 
     
     
 if __name__ == '__main__':
