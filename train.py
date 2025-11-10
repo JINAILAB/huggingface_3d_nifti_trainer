@@ -356,13 +356,15 @@ def main():
     output_dir = os.path.join('runs', custom_args.project_name, model_name + '_' + now)
     
     # initialize wandb
-    if training_args.report_to == 'wandb':
+    if 'wandb' in training_args.report_to:
         wandb.init(project=custom_args.project_name, name=model_name + '_' + now, dir=output_dir)
         wandb.config.update({'dataset_name' : data_args.dataset_name})
-    
+        wandb.config.update(custom_args)
+        wandb.config.update(model_args)
+        wandb.config.update(data_args)
     # Save config to JSON
     os.makedirs(output_dir, exist_ok=True)
-    config_dict = {**vars(model_args), **vars(data_args), **vars(training_args)}
+    config_dict = {**vars(model_args), **vars(data_args), **vars(training_args), **vars(custom_args)}
     with open(os.path.join(output_dir, "config.json"), 'w', encoding='utf-8') as f:
         json.dump(config_dict, f, indent=2, ensure_ascii=False, default=str)
 

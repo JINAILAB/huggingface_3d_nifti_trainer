@@ -153,13 +153,15 @@ class CustomImagePipeline(Pipeline):
         if isinstance(inputs, torch.Tensor):
             # 텐서의 차원 확인
             if inputs.dim() == 3:
+                inputs = inputs.unsqueeze(0).unsqueeze(0)
+            if inputs.dim() == 4:
                 # 배치 차원이 없으면 추가
                 inputs = inputs.unsqueeze(0)
-            elif inputs.dim() == 4:
+            elif inputs.dim() == 5:
                 # 이미 배치 차원이 있으면 그대로
                 pass
             else:
-                raise ValueError("예상치 못한 입력 텐서 모양입니다. 3 또는 4차원이어야 합니다.")
+                raise ValueError("예상치 못한 입력 텐서 모양입니다. 3 또는 4 또는 5차원이어야 합니다.")
         else:
             # 다른 유형의 입력일 경우, image_processor로 처리
             inputs = self.image_processor(images=inputs, return_tensors="pt").pixel_values
